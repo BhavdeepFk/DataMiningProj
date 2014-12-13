@@ -1,4 +1,4 @@
 DataMiningProj
 ==============
 
-Repo for running basic Data Mining scripts
+Repo for running basic Machine Learning / Data Mining scripts
