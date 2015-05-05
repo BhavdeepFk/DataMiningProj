@@ -153,7 +153,8 @@ class NeuralNet(object):
         self._rho = rho  # ``momentum'' for adadelta
         self._eps = eps  # epsilon for adadelta
         self._mu = mu
-        self._accugrads = []  # for adadelta
+        self._accugrads = []  # for adagrad
+        self._accuDeltragrads = []  # for adadelta
         self._accudeltas = []  # for adadelta
         self._momentum = [] # for momentum
         self._sag_gradient_memory = []  # for SAG
@@ -179,17 +180,19 @@ class NeuralNet(object):
             #self.pre_activations.extend(this_layer.pre_activation)# SAG specific TODO 
             self._accugrads.extend([build_shared_zeros(t.shape.eval(),
                 'accugrad') for t in this_layer.params])
+            self._accuDeltragrads.extend([build_shared_zeros(t.shape.eval(),
+                'accuDeltragrads') for t in this_layer.params])
+            
             self._accudeltas.extend([build_shared_zeros(t.shape.eval(),
                 'accudelta') for t in this_layer.params])
             self._momentum.extend([build_shared_zeros(t.shape.eval(),
                 'momentum') for t in this_layer.params])
-            self._momentum.extend([build_shared_zeros(t.shape.eval(),
+            self._nag.extend([build_shared_zeros(t.shape.eval(),
                 'nag') for t in this_layer.params])
-
 
             self._sag_gradient_memory.extend([build_shared_zeros(tuple([(x_train.shape[0]+BATCH_SIZE-1) / BATCH_SIZE] + list(t.shape.eval())), 'sag_gradient_memory') for t in this_layer.params])
             #self._sag_gradient_memory.extend([[build_shared_zeros(t.shape.eval(), 'sag_gradient_memory') for _ in xrange(x_train.shape[0] / BATCH_SIZE + 1)] for t in this_layer.params])
-
+            #print self._accugrads[0].shape.eval()
             self.layers.append(this_layer)
             layer_input = this_layer.output
 
@@ -249,6 +252,7 @@ class NeuralNet(object):
         updates = OrderedDict()
         for accugrad, param, gparam in zip(self._accugrads, self.params, gparams):
             # c.f. Algorithm 1 in the Adadelta paper (Zeiler 2012)
+            
             agrad = accugrad + gparam * gparam
             dx = - (learning_rate / T.sqrt(agrad + self._eps)) * gparam
             updates[param] = param + dx
@@ -274,16 +278,16 @@ class NeuralNet(object):
 
         # compute list of weights updates
         updates = OrderedDict()
-        for accugrad, accudelta, param, gparam in zip(self._accugrads,
+        for accuDeltragrads, accudelta, param, gparam in zip(self._accuDeltragrads,
                 self._accudeltas, self.params, gparams):
             # c.f. Algorithm 1 in the Adadelta paper (Zeiler 2012)
-            agrad = self._rho * accugrad + (1 - self._rho) * gparam * gparam
+            agrad = self._rho * accuDeltragrads + (1 - self._rho) * gparam * gparam
             dx = - T.sqrt((accudelta + self._eps)
                           / (agrad + self._eps)) * gparam
             updates[accudelta] = (self._rho * accudelta
                                   + (1 - self._rho) * dx * dx)
             updates[param] = param + dx
-            updates[accugrad] = agrad
+            updates[accuDeltragrads] = agrad
 
         train_fn = theano.function(inputs=[theano.Param(batch_x),
                                            theano.Param(batch_y)],
@@ -311,6 +315,7 @@ class NeuralNet(object):
         apply_momentum : Generic function applying momentum to updates
         nesterov_momentum : Nesterov's variant of SGD with momentum
         """
+
         batch_x = T.fmatrix('batch_x')
         batch_y = T.ivector('batch_y')
         learning_rate = T.fscalar('lr')  # learning rate to use
@@ -319,11 +324,10 @@ class NeuralNet(object):
         # compute list of weights updates
         updates = OrderedDict()
         
-        for momentum, param, gparam in zip(self._momentum, self.param, gparams):
+        for momentum, param, gparam in zip(self._momentum, self.params, gparams):
             currMomentum = self._mu * momentum - learning_rate * gparam
             updates[param] = param + currMomentum 
-            updates[momentum] = currMomentum
-
+            updates[momentum] = currMomentum      
         
         train_fn = theano.function(inputs=[theano.Param(batch_x), 
             theano.Param(batch_y),
@@ -358,22 +362,13 @@ class NeuralNet(object):
         # compute the gradients with respect to the model parameters
         gparams = T.grad(self.mean_cost, self.params)
         # compute list of weights updates
-        updates = OrderedDict()
-
-        for momentum, param, gparam in zip(self._momentum, self.param, gparams):
-            currMomentum = self._mu * momentum - learning_rate * gparam
-            updates[param] = param + currMomentum 
-            updates[momentum] = currMomentum
-
+        updates = OrderedDict()        
         
-        for nag, param, gparam in zip(self._nag, self.param, gparams):
-            currNag = self._mu * nag - learning_rate * gparam
-            updates[nag] = currNag
+        for nag, param, gparam in zip(self._nag, self.params, gparams):
+            currNag = self._mu * nag - (learning_rate * gparam)
+            updates[param] = self._mu*currNag + param  - (learning_rate * gparam)
+            updates[nag] = currNag                    
             
-
-            updates[param] = param + currMomentum 
-            
-
         
         train_fn = theano.function(inputs=[theano.Param(batch_x), 
             theano.Param(batch_y),
@@ -430,7 +425,7 @@ class RegularizedNet(NeuralNet):
             self.cost = self.cost + L2_reg * L2
 
     def fit(self, x_train, y_train, x_dev=None, y_dev=None,
-            max_epochs=20, early_stopping=True, split_ratio=0.1, # TODO 100+ epochs
+            max_epochs=40, early_stopping=True, split_ratio=0.1, # TODO 100+ epochs
             method='adadelta', verbose=False, plot=False):
         """
         Fits the neural network to `x_train` and `y_train`. 
@@ -448,6 +443,10 @@ class RegularizedNet(NeuralNet):
             train_fn = self.get_adagrad_trainer()
         elif method == 'adadelta':
             train_fn = self.get_adadelta_trainer()
+        elif method == 'momentum':
+            train_fn = self.get_momentum_trainer()
+        elif method == 'nag':
+            train_fn = self.get_nag_trainer()
         elif method == 'sag':
             #train_fn = self.get_SAG_trainer(R=1+numpy.max(numpy.sum(x_train**2, axis=1)))
             if BATCH_SIZE > 1:
@@ -497,7 +496,7 @@ class RegularizedNet(NeuralNet):
                         avg_costs.append(avg_cost)
             else:
                 for x, y in train_set_iterator:
-                    if method == 'sgd' or method == 'adagrad':
+                    if method == 'sgd' or method == 'adagrad' or method == 'momentum' or method == 'nag':
                         lr = numpy.asarray(1.E-2, dtype='float32')
                         avg_cost = train_fn(x, y, lr=lr)
                         #avg_cost = train_fn(x, y, lr=1.E-2)
@@ -584,28 +583,9 @@ if __name__ == "__main__":
     PLOT = True
 
     def train_models(x_train, y_train, x_test, y_test, n_features, n_outs,
-            use_dropout=False, n_epochs=40, numpy_rng=None,
+            use_dropout=False, n_epochs=100, numpy_rng=None,
             svms=False, nb=False, deepnn=True, name=''):
-        if svms:
-            print("Linear SVM")
-            classifier = svm.SVC(gamma=0.001)
-            print(classifier)
-            classifier.fit(x_train, y_train)
-            print("score: %f" % classifier.score(x_test, y_test))
-
-            print("RBF-kernel SVM")
-            classifier = svm.SVC(kernel='rbf', class_weight='auto')
-            print(classifier)
-            classifier.fit(x_train, y_train)
-            print("score: %f" % classifier.score(x_test, y_test))
-
-        if nb:
-            print("Multinomial Naive Bayes")
-            classifier = naive_bayes.MultinomialNB()
-            print(classifier)
-            classifier.fit(x_train, y_train)
-            print("score: %f" % classifier.score(x_test, y_test))
-
+  
         if deepnn:
             import warnings
             warnings.filterwarnings("ignore")  # TODO remove
@@ -613,7 +593,7 @@ if __name__ == "__main__":
 
             def new_regNet_dnn():
                     print("Simple (regularized) DNN")
-                    return RegularizedNet(numpy_rng=numpy_rng, n_ins=n_features,
+                    return RegularizedNet(numpy_rng=numpy.random.RandomState(123), n_ins=n_features,
                         #layers_types=[LogisticRegression],
                         #layers_sizes=[],
                         #layers_types=[ReLU, ReLU, ReLU, LogisticRegression],
@@ -634,7 +614,7 @@ if __name__ == "__main__":
             ax3 = plt.subplot(223)
             ax4 = plt.subplot(224)  # TODO updates of the weights
             #for method in ['sag']:
-            for method in ['sgd', 'adagrad', 'adadelta']:
+            for method in ['sgd', 'momentum', 'nag']:# 'adagrad', 'adadelta']:
                 dnn = new_regNet_dnn()
                 print dnn
                 dnn.fit(x_train, y_train, max_epochs=n_epochs, method=method, verbose=VERBOSE, plot=PLOT)
